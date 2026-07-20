@@ -2,13 +2,15 @@
 //! mailbox-name validation, and `paginate` shared with m2dir.
 
 use alloc::{
+    collections::{BTreeMap, BTreeSet},
     string::{String, ToString},
     vec::Vec,
 };
 
 use io_maildir::{
-    flag::types::{MaildirFlag, MaildirFlags},
-    path::MaildirPath,
+    entry::headers::extract_keywords_header,
+    flag::types::{KeywordHeader, MaildirFlag, MaildirFlags},
+    path::{FsPath, MaildirPath},
 };
 use thiserror::Error;
 
@@ -60,6 +62,45 @@ pub(crate) fn flag_from_char(c: char) -> Option<Flag> {
         'P' => Some(Flag::from_iana(IanaFlag::Forwarded)),
         _ => None,
     }
+}
+
+/// Rebuilds the shared [`Flag`] set of a Maildir message, mirroring
+/// the keyword persistence of
+/// [`io_maildir::client::MaildirClient::store`].
+///
+/// Standard info-section letters map to their IANA flags. Custom
+/// keywords come back through the `dovecot_table` slot letters, or
+/// through the `keywords_header` line, or not at all when both are
+/// off, which is the strict-Maildir default.
+pub(crate) fn flags_from_maildir(
+    path: &FsPath,
+    contents: &[u8],
+    dovecot_table: &BTreeMap<char, String>,
+    keywords_header: Option<KeywordHeader>,
+) -> BTreeSet<Flag> {
+    let mut flags = BTreeSet::new();
+
+    if let Some(name) = path.file_name() {
+        if let Some((_, letters)) = name.rsplit_once(',') {
+            for c in letters.chars() {
+                if let Some(flag) = flag_from_char(c) {
+                    flags.insert(flag);
+                } else if c.is_ascii_lowercase() {
+                    if let Some(keyword) = dovecot_table.get(&c) {
+                        flags.insert(Flag::from_raw(keyword.clone()));
+                    }
+                }
+            }
+        }
+    }
+
+    if let Some(header) = keywords_header {
+        for keyword in extract_keywords_header(contents, header) {
+            flags.insert(Flag::from_raw(keyword));
+        }
+    }
+
+    flags
 }
 
 /// 1-indexed in-memory pagination shared with m2dir; `page_size = None`

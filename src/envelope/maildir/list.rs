@@ -11,7 +11,11 @@
 //! let envs = client.run(MaildirEnvelopeList::new(&client.store, "INBOX", Some(1), Some(50))?)?;
 //! ```
 
-use alloc::{collections::BTreeSet, string::ToString, vec::Vec};
+use alloc::{
+    collections::{BTreeMap, BTreeSet},
+    string::{String, ToString},
+    vec::Vec,
+};
 use core::mem;
 
 use chrono::DateTime;
@@ -21,6 +25,7 @@ use io_maildir::{
         list::{MaildirEntryList as InnerList, MaildirEntryListError as InnerErr},
         types::{MaildirEntry, MaildirFullEntry},
     },
+    flag::types::KeywordHeader,
     maildir::types::Maildir,
     path::FsPath,
     store::MaildirStore,
@@ -32,8 +37,7 @@ use thiserror::Error;
 use crate::{
     address::Address,
     envelope::types::{Envelope, normalize_message_id},
-    flag::types::Flag,
-    maildir::convert::{InvalidMailboxName, flag_from_char, mailbox_path, paginate},
+    maildir::convert::{InvalidMailboxName, flags_from_maildir, mailbox_path, paginate},
 };
 
 /// Errors produced by [`MaildirEnvelopeList`].
@@ -55,14 +59,20 @@ pub struct MaildirEnvelopeList {
     state: State,
     page: Option<u32>,
     page_size: Option<u32>,
+    dovecot_table: BTreeMap<char, String>,
+    keywords_header: Option<KeywordHeader>,
 }
 
 impl MaildirEnvelopeList {
+    /// `dovecot_table` and `keywords_header` mirror the write path, so
+    /// a keyword persisted on add or store is surfaced back here.
     pub fn new(
         store: &MaildirStore,
         mailbox: &str,
         page: Option<u32>,
         page_size: Option<u32>,
+        dovecot_table: BTreeMap<char, String>,
+        keywords_header: Option<KeywordHeader>,
     ) -> Result<Self, MaildirEnvelopeListError> {
         trace!("prepare Maildir envelope listing");
         let path = mailbox_path(mailbox)?;
@@ -71,6 +81,8 @@ impl MaildirEnvelopeList {
             state: State::Listing(InnerList::new(maildir)),
             page,
             page_size,
+            dovecot_table,
+            keywords_header,
         })
     }
 }
@@ -113,10 +125,11 @@ impl MaildirCoroutine for MaildirEnvelopeList {
                     .into_iter()
                     .filter_map(|entry| {
                         let bytes = contents.remove(entry.path())?;
-                        Some(envelope_from_entry(&MaildirFullEntry::from((
-                            entry.path().clone(),
-                            bytes,
-                        ))))
+                        Some(envelope_from_entry(
+                            &MaildirFullEntry::from((entry.path().clone(), bytes)),
+                            &self.dovecot_table,
+                            self.keywords_header,
+                        ))
                     })
                     .collect();
                 envelopes.sort_by(|a, b| b.date.cmp(&a.date));
@@ -135,9 +148,18 @@ enum State {
     Done,
 }
 
-fn envelope_from_entry(entry: &MaildirFullEntry) -> Envelope {
+fn envelope_from_entry(
+    entry: &MaildirFullEntry,
+    dovecot_table: &BTreeMap<char, String>,
+    keywords_header: Option<KeywordHeader>,
+) -> Envelope {
     let id = entry.id().unwrap_or_default().to_string();
-    let flags = parse_filename_flags(entry.path());
+    let flags = flags_from_maildir(
+        entry.path(),
+        entry.contents(),
+        dovecot_table,
+        keywords_header,
+    );
     let size = entry.contents().len() as u64;
     let parsed = entry.parsed();
 
@@ -182,17 +204,6 @@ fn envelope_from_entry(entry: &MaildirFullEntry) -> Envelope {
         size,
         has_attachment,
     }
-}
-
-/// IANA flags from a Maildir filename's info section.
-fn parse_filename_flags(path: &FsPath) -> BTreeSet<Flag> {
-    let Some(name) = path.file_name() else {
-        return BTreeSet::new();
-    };
-    let Some((_, letters)) = name.rsplit_once(',') else {
-        return BTreeSet::new();
-    };
-    letters.chars().filter_map(flag_from_char).collect()
 }
 
 /// mail-parser address group to shared [`Address`] list.

@@ -14,7 +14,7 @@
 //! ```
 
 use alloc::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     string::{String, ToString},
     vec::Vec,
 };
@@ -27,6 +27,7 @@ use io_maildir::{
         list::{MaildirEntryList as InnerList, MaildirEntryListError as InnerErr},
         types::{MaildirEntry, MaildirFullEntry},
     },
+    flag::types::KeywordHeader,
     maildir::types::Maildir,
     path::FsPath,
     store::MaildirStore,
@@ -38,8 +39,7 @@ use thiserror::Error;
 use crate::{
     address::Address,
     envelope::types::{Envelope, normalize_message_id},
-    flag::types::Flag,
-    maildir::convert::{InvalidMailboxName, flag_from_char, mailbox_path, paginate},
+    maildir::convert::{InvalidMailboxName, flags_from_maildir, mailbox_path, paginate},
     search::{
         filter::query::SearchEmailsFilterQuery,
         query::SearchEmailsQuery,
@@ -68,15 +68,21 @@ pub struct MaildirEnvelopeSearch {
     sort: Option<Vec<SearchEmailsSorter>>,
     page: Option<u32>,
     page_size: Option<u32>,
+    dovecot_table: BTreeMap<char, String>,
+    keywords_header: Option<KeywordHeader>,
 }
 
 impl MaildirEnvelopeSearch {
+    /// `dovecot_table` and `keywords_header` mirror the write path, so
+    /// a keyword persisted on add or store is surfaced back here.
     pub fn new(
         store: &MaildirStore,
         mailbox: &str,
         query: Option<&SearchEmailsQuery>,
         page: Option<u32>,
         page_size: Option<u32>,
+        dovecot_table: BTreeMap<char, String>,
+        keywords_header: Option<KeywordHeader>,
     ) -> Result<Self, MaildirEnvelopeSearchError> {
         trace!("prepare Maildir envelope search");
         let path = mailbox_path(mailbox)?;
@@ -87,6 +93,8 @@ impl MaildirEnvelopeSearch {
             sort: query.and_then(|q| q.sort.clone()),
             page,
             page_size,
+            dovecot_table,
+            keywords_header,
         })
     }
 }
@@ -131,7 +139,12 @@ impl MaildirCoroutine for MaildirEnvelopeSearch {
                     let Some(bytes) = contents.remove(entry.path()) else {
                         continue;
                     };
-                    let envelope = envelope_from_bytes(entry.path(), &bytes);
+                    let envelope = envelope_from_bytes(
+                        entry.path(),
+                        &bytes,
+                        &self.dovecot_table,
+                        self.keywords_header,
+                    );
                     let keep = match self.filter.as_ref() {
                         Some(f) => matches_filter(&envelope, &bytes, f),
                         None => true,
@@ -165,10 +178,20 @@ enum State {
 
 /// Builds an [`Envelope`] from a Maildir file: filename flags +
 /// RFC 5322 headers via mail-parser.
-fn envelope_from_bytes(path: &FsPath, bytes: &[u8]) -> Envelope {
+fn envelope_from_bytes(
+    path: &FsPath,
+    bytes: &[u8],
+    dovecot_table: &BTreeMap<char, String>,
+    keywords_header: Option<KeywordHeader>,
+) -> Envelope {
     let entry = MaildirFullEntry::from((path.clone(), bytes.to_vec()));
     let id = entry.id().unwrap_or_default().to_string();
-    let flags = parse_filename_flags(entry.path());
+    let flags = flags_from_maildir(
+        entry.path(),
+        entry.contents(),
+        dovecot_table,
+        keywords_header,
+    );
     let size = entry.contents().len() as u64;
     let parsed = entry.parsed();
 
@@ -213,16 +236,6 @@ fn envelope_from_bytes(path: &FsPath, bytes: &[u8]) -> Envelope {
         size,
         has_attachment,
     }
-}
-
-fn parse_filename_flags(path: &FsPath) -> BTreeSet<Flag> {
-    let Some(name) = path.file_name() else {
-        return BTreeSet::new();
-    };
-    let Some((_, letters)) = name.rsplit_once(',') else {
-        return BTreeSet::new();
-    };
-    letters.chars().filter_map(flag_from_char).collect()
 }
 
 fn addresses_from(addrs: &MailParserAddress<'_>) -> Vec<Address> {
