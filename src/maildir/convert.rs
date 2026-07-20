@@ -3,12 +3,17 @@
 //! the m2dir backend.
 
 use alloc::{
+    collections::{BTreeMap, BTreeSet},
     string::{String, ToString},
     vec::Vec,
 };
 use std::path::{Path, PathBuf};
 
-use io_maildir::flag::{MaildirFlag, MaildirFlags};
+use io_maildir::{
+    flag::{KeywordHeader, MaildirFlag, MaildirFlags},
+    headers::extract_keywords_header,
+    path::MaildirPath,
+};
 use thiserror::Error;
 
 use crate::flag::{Flag, IanaFlag};
@@ -87,6 +92,54 @@ pub(crate) fn flag_from_char(c: char) -> Option<Flag> {
         'P' => Some(Flag::from_iana(IanaFlag::Forwarded)),
         _ => None,
     }
+}
+
+/// Reconstructs the full shared [`Flag`] set for a Maildir message,
+/// symmetrically with the write path's keyword persistence.
+///
+/// Standard info-section letters (`S`/`R`/`F`/`D`/`T`/`P`) always map
+/// to their IANA flags. Custom keywords are recovered from whichever
+/// sidecar mechanism is configured, mirroring
+/// [`io_maildir::client::MaildirClient::store`]:
+///
+/// - `dovecot_table` (from `load_dovecot_keywords`): non-empty when
+///   `dovecot_keywords` is enabled. Lowercase `a..z` slot letters in
+///   the filename resolve through it to their keyword strings.
+/// - `keywords_header`: when `Some`, the message body's `X-Keywords` /
+///   `X-Label` header is parsed for keyword strings.
+///
+/// With both off (empty table + `None`) the result is byte-for-byte
+/// the strict-Maildir standard-letter set — custom keywords stay
+/// dropped, preserving the documented default.
+pub(crate) fn flags_from_maildir(
+    path: &MaildirPath,
+    contents: &[u8],
+    dovecot_table: &BTreeMap<char, String>,
+    keywords_header: Option<KeywordHeader>,
+) -> BTreeSet<Flag> {
+    let mut flags = BTreeSet::new();
+
+    if let Some(name) = path.file_name() {
+        if let Some((_, letters)) = name.rsplit_once(',') {
+            for c in letters.chars() {
+                if let Some(flag) = flag_from_char(c) {
+                    flags.insert(flag);
+                } else if c.is_ascii_lowercase() {
+                    if let Some(keyword) = dovecot_table.get(&c) {
+                        flags.insert(Flag::from_raw(keyword.clone()));
+                    }
+                }
+            }
+        }
+    }
+
+    if let Some(header) = keywords_header {
+        for keyword in extract_keywords_header(contents, header) {
+            flags.insert(Flag::from_raw(keyword));
+        }
+    }
+
+    flags
 }
 
 /// 1-indexed pagination on an in-memory list. `page_size = None`

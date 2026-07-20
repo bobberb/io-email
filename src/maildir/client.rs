@@ -15,8 +15,15 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
+use alloc::collections::BTreeMap;
+
 use gethostname::gethostname;
-use io_maildir::{client::MaildirClient as InnerMaildirClient, coroutine::*, path::MaildirPath};
+use io_maildir::{
+    client::MaildirClient as InnerMaildirClient,
+    coroutine::*,
+    maildir::{Maildir, MaildirSubdir},
+    path::MaildirPath,
+};
 use log::trace;
 use thiserror::Error;
 
@@ -25,12 +32,13 @@ use crate::{
     flag::{Flag, FlagOp},
     mailbox::Mailbox,
     maildir::{
+        convert::{flags_to_maildir, resolve_mailbox},
         envelope_list::{MaildirEnvelopeList, MaildirEnvelopeListError},
-        flag_store::{MaildirFlagStore, MaildirFlagStoreError},
+        flag_store::MaildirFlagStoreError,
         mailbox_create::{MaildirMailboxCreate, MaildirMailboxCreateError},
+        message_add::MaildirMessageAddError,
         mailbox_delete::{MaildirMailboxDelete, MaildirMailboxDeleteError},
         mailbox_list::{MaildirMailboxList, MaildirMailboxListError},
-        message_add::{MaildirMessageAdd, MaildirMessageAddError},
         message_copy::{MaildirMessageCopy, MaildirMessageCopyError},
         message_delete::{MaildirMessageDelete, MaildirMessageDeleteError},
         message_get::{MaildirMessageGet, MaildirMessageGetError},
@@ -75,6 +83,8 @@ pub enum MaildirClientError {
     MessageMove(#[from] MaildirMessageMoveError),
     #[error(transparent)]
     Inner(#[from] io_maildir::client::MaildirClientError),
+    #[error(transparent)]
+    InvalidMailbox(#[from] crate::maildir::convert::InvalidMailboxName),
 }
 
 /// Std-blocking Maildir client built on a filesystem root.
@@ -221,6 +231,30 @@ impl MaildirClient {
         }
     }
 
+    /// Resolves `mailbox` to its on-disk [`Maildir`], honouring the
+    /// inner client's `maildir_plus` layout. Used to reach the inner
+    /// client's keyword-aware read/write helpers.
+    fn open_maildir(&self, mailbox: &str) -> Result<Maildir, MaildirClientError> {
+        let root = std::path::PathBuf::from(self.inner.root().clone());
+        let path = resolve_mailbox(&root, self.inner.maildir_plus, mailbox)?;
+        Ok(Maildir::from_path(path))
+    }
+
+    /// Loads the folder's `dovecot-keywords` slot table when the
+    /// `dovecot_keywords` knob is set, else an empty table. Read and
+    /// write paths share this so a keyword persisted on write is
+    /// resolvable on read.
+    fn dovecot_table_for(
+        &self,
+        maildir: &Maildir,
+    ) -> Result<BTreeMap<char, String>, MaildirClientError> {
+        if self.inner.dovecot_keywords {
+            Ok(self.inner.load_dovecot_keywords(maildir)?)
+        } else {
+            Ok(BTreeMap::new())
+        }
+    }
+
     /// Lists every Maildir under the configured root. `with_counts`
     /// is currently a no-op; see [`MaildirMailboxList`] for the path
     /// to surfacing per-mailbox totals.
@@ -246,12 +280,15 @@ impl MaildirClient {
     ) -> Result<Vec<Envelope>, MaildirClientError> {
         let root = self.inner.root().clone();
         let maildir_plus = self.inner.maildir_plus;
+        let dovecot_table = self.dovecot_table_for(&self.open_maildir(mailbox)?)?;
         self.run(MaildirEnvelopeList::new(
             std::path::PathBuf::from(root),
             maildir_plus,
             mailbox,
             page,
             page_size,
+            dovecot_table,
+            self.inner.keywords_header,
         )?)
     }
 
@@ -268,6 +305,7 @@ impl MaildirClient {
     ) -> Result<Vec<Envelope>, MaildirClientError> {
         let root = self.inner.root().clone();
         let maildir_plus = self.inner.maildir_plus;
+        let dovecot_table = self.dovecot_table_for(&self.open_maildir(mailbox)?)?;
         self.run(MaildirEnvelopeSearch::new(
             std::path::PathBuf::from(root),
             maildir_plus,
@@ -275,10 +313,23 @@ impl MaildirClient {
             query,
             page,
             page_size,
+            dovecot_table,
+            self.inner.keywords_header,
         )?)
     }
 
     /// Adds, sets, or removes `flags` on a Maildir id set.
+    ///
+    /// Delegates to the inner client's keyword-aware flag helpers so
+    /// that custom keywords in `flags` are persisted through the
+    /// `dovecot-keywords` slot table when the `dovecot_keywords` knob
+    /// is set (symmetrically with the read path). With the knob off,
+    /// keywords are dropped — strict-Maildir default, unchanged.
+    ///
+    /// Note: the `keywords_header` mechanism only applies at message
+    /// creation ([`Self::add_message`]); a flag store is a filename
+    /// rename and cannot inject a body header, matching the inner
+    /// io-maildir flag-store behaviour.
     pub fn store_flags(
         &self,
         mailbox: &str,
@@ -286,16 +337,18 @@ impl MaildirClient {
         flags: &[Flag],
         op: FlagOp,
     ) -> Result<(), MaildirClientError> {
-        let root = self.inner.root().clone();
-        let maildir_plus = self.inner.maildir_plus;
-        self.run(MaildirFlagStore::new(
-            std::path::PathBuf::from(root),
-            maildir_plus,
-            mailbox,
-            ids,
-            flags,
-            op,
-        )?)
+        let maildir = self.open_maildir(mailbox)?;
+        let md_flags = flags_to_maildir(flags);
+        for id in ids {
+            match op {
+                FlagOp::Add => self.inner.add_flags(maildir.clone(), *id, md_flags.clone())?,
+                FlagOp::Set => self.inner.set_flags(maildir.clone(), *id, md_flags.clone())?,
+                FlagOp::Remove => self
+                    .inner
+                    .remove_flags(maildir.clone(), *id, md_flags.clone())?,
+            }
+        }
+        Ok(())
     }
 
     /// Reads one message's raw RFC 5322 bytes from `mailbox`.
@@ -312,21 +365,26 @@ impl MaildirClient {
 
     /// Appends `raw` to `mailbox` under `cur/` with the given flags.
     /// Returns the Maildir filename minus the `:2,FLAGS` suffix.
+    ///
+    /// Delegates to the inner client's keyword-aware `store` so custom
+    /// keywords in `flags` are persisted per the configured knobs:
+    /// `keywords_header` injects an `X-Keywords`/`X-Label` line into
+    /// `raw`, and `dovecot_keywords` allocates slot letters and
+    /// updates the folder table (read back symmetrically by
+    /// [`Self::list_envelopes`]). With both off, keywords are dropped
+    /// — strict-Maildir default, byte-for-byte unchanged.
     pub fn add_message(
         &self,
         mailbox: &str,
         flags: &[Flag],
         raw: Vec<u8>,
     ) -> Result<String, MaildirClientError> {
-        let root = self.inner.root().clone();
-        let maildir_plus = self.inner.maildir_plus;
-        self.run(MaildirMessageAdd::new(
-            std::path::PathBuf::from(root),
-            maildir_plus,
-            mailbox,
-            flags,
-            raw,
-        )?)
+        let maildir = self.open_maildir(mailbox)?;
+        let md_flags = flags_to_maildir(flags);
+        let (id, _path) = self
+            .inner
+            .store(maildir, MaildirSubdir::Cur, md_flags, raw)?;
+        Ok(id)
     }
 
     /// Creates `name` as a new Maildir under the configured root.
@@ -409,4 +467,144 @@ fn normalize_path(path: std::path::PathBuf) -> MaildirPath {
     #[cfg(windows)]
     let s = s.replace('\\', "/");
     MaildirPath::new(s)
+}
+
+#[cfg(test)]
+mod tests {
+    use alloc::{
+        string::{String, ToString},
+        vec::Vec,
+    };
+
+    use io_maildir::flag::KeywordHeader;
+
+    use super::*;
+    use crate::flag::Flag;
+
+    const KEYWORD: &str = "NonJunk";
+
+    fn raw_message() -> Vec<u8> {
+        b"Subject: keyword round-trip\r\n\
+          From: a@b\r\n\
+          To: c@d\r\n\
+          Date: Thu, 15 May 2026 10:00:00 +0000\r\n\
+          \r\n\
+          body\r\n"
+            .to_vec()
+    }
+
+    /// Returns the set of raw flag spellings surfaced for the single
+    /// message the caller just wrote into `INBOX`.
+    fn read_back_flags(client: &MaildirClient) -> Vec<String> {
+        let envelopes = client
+            .list_envelopes("INBOX", None, None, false)
+            .expect("list_envelopes");
+        assert_eq!(envelopes.len(), 1, "expected exactly one message");
+        envelopes[0]
+            .flags
+            .iter()
+            .map(|f| f.raw().to_string())
+            .collect()
+    }
+
+    fn setup(dir: &std::path::Path) -> MaildirClient {
+        let client = MaildirClient::new(dir.to_string_lossy().into_owned());
+        client.create_mailbox("INBOX").expect("create INBOX");
+        client
+    }
+
+    #[test]
+    fn dovecot_keywords_round_trip_through_public_api() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut client = setup(tmp.path());
+        client.inner.dovecot_keywords = true;
+
+        client
+            .add_message("INBOX", &[Flag::from_raw(KEYWORD)], raw_message())
+            .expect("add_message");
+
+        // The sidecar table must exist and the keyword must survive the
+        // filename-slot round-trip through list_envelopes.
+        let dovecot_file = tmp.path().join("INBOX").join("dovecot-keywords");
+        assert!(dovecot_file.is_file(), "dovecot-keywords file not written");
+
+        let raws = read_back_flags(&client);
+        assert!(
+            raws.iter().any(|r| r == KEYWORD),
+            "keyword `{KEYWORD}` not surfaced on read; got {raws:?}"
+        );
+    }
+
+    #[test]
+    fn keywords_header_round_trip_through_public_api() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut client = setup(tmp.path());
+        client.inner.keywords_header = Some(KeywordHeader::XKeywords);
+
+        let id = client
+            .add_message("INBOX", &[Flag::from_raw(KEYWORD)], raw_message())
+            .expect("add_message");
+
+        // The keyword must be persisted as an injected header, not a
+        // dovecot sidecar (which stays absent under this knob).
+        let raw = client.get_message("INBOX", &id).expect("get_message");
+        let text = String::from_utf8_lossy(&raw);
+        assert!(
+            text.contains("X-Keywords:") && text.contains(KEYWORD),
+            "X-Keywords header not injected; got:\n{text}"
+        );
+        assert!(
+            !tmp.path().join("INBOX").join("dovecot-keywords").exists(),
+            "dovecot-keywords file written despite header-only knob"
+        );
+
+        let raws = read_back_flags(&client);
+        assert!(
+            raws.iter().any(|r| r == KEYWORD),
+            "keyword `{KEYWORD}` not surfaced on read; got {raws:?}"
+        );
+    }
+
+    #[test]
+    fn strict_default_drops_keyword() {
+        let tmp = tempfile::tempdir().unwrap();
+        let client = setup(tmp.path());
+        // Both knobs at their strict-Maildir defaults (off / None).
+
+        client
+            .add_message("INBOX", &[Flag::from_raw(KEYWORD)], raw_message())
+            .expect("add_message");
+
+        assert!(
+            !tmp.path().join("INBOX").join("dovecot-keywords").exists(),
+            "dovecot-keywords file written under strict default"
+        );
+
+        let raws = read_back_flags(&client);
+        assert!(
+            !raws.iter().any(|r| r == KEYWORD),
+            "keyword leaked under strict default; got {raws:?}"
+        );
+    }
+
+    #[test]
+    fn store_flags_persists_keyword_via_dovecot() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut client = setup(tmp.path());
+        client.inner.dovecot_keywords = true;
+
+        // Write clean, then add the keyword via a flag store.
+        let id = client
+            .add_message("INBOX", &[], raw_message())
+            .expect("add_message");
+        client
+            .store_flags("INBOX", &[&id], &[Flag::from_raw(KEYWORD)], FlagOp::Add)
+            .expect("store_flags add");
+
+        let raws = read_back_flags(&client);
+        assert!(
+            raws.iter().any(|r| r == KEYWORD),
+            "keyword not persisted by store_flags; got {raws:?}"
+        );
+    }
 }

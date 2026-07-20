@@ -13,7 +13,11 @@
 //!
 //! [`MaildirMessagesList`]: io_maildir::coroutines::message_list::MaildirMessagesList
 
-use alloc::{collections::BTreeSet, string::ToString, vec::Vec};
+use alloc::{
+    collections::{BTreeMap, BTreeSet},
+    string::{String, ToString},
+    vec::Vec,
+};
 use core::mem;
 use std::path::PathBuf;
 
@@ -24,6 +28,7 @@ use io_maildir::{
         MaildirMessagesList as InnerList, MaildirMessagesListError as InnerErr,
     },
     entry::MaildirEntry,
+    flag::KeywordHeader,
     maildir::Maildir,
     message::MaildirMessage,
     path::MaildirPath,
@@ -35,8 +40,7 @@ use thiserror::Error;
 use crate::{
     address::Address,
     envelope::{Envelope, normalize_message_id},
-    flag::Flag,
-    maildir::convert::{InvalidMailboxName, flag_from_char, paginate, resolve_mailbox},
+    maildir::convert::{InvalidMailboxName, flags_from_maildir, paginate, resolve_mailbox},
 };
 
 /// Errors produced by [`MaildirEnvelopeList`].
@@ -58,15 +62,24 @@ pub struct MaildirEnvelopeList {
     state: State,
     page: Option<u32>,
     page_size: Option<u32>,
+    dovecot_table: BTreeMap<char, String>,
+    keywords_header: Option<KeywordHeader>,
 }
 
 impl MaildirEnvelopeList {
+    /// `dovecot_table` is the folder's `dovecot-keywords` slot table
+    /// (empty when `dovecot_keywords` is off); `keywords_header`
+    /// selects the body header to parse for keywords (none when
+    /// unset). Both are read symmetrically with the write path so a
+    /// keyword persisted on add/store is surfaced here.
     pub fn new(
         root: impl Into<PathBuf>,
         maildir_plus: bool,
         mailbox: &str,
         page: Option<u32>,
         page_size: Option<u32>,
+        dovecot_table: BTreeMap<char, String>,
+        keywords_header: Option<KeywordHeader>,
     ) -> Result<Self, MaildirEnvelopeListError> {
         trace!("prepare Maildir envelope listing");
         let path = resolve_mailbox(&root.into(), maildir_plus, mailbox)?;
@@ -75,6 +88,8 @@ impl MaildirEnvelopeList {
             state: State::Listing(InnerList::new(maildir)),
             page,
             page_size,
+            dovecot_table,
+            keywords_header,
         })
     }
 }
@@ -117,10 +132,11 @@ impl MaildirCoroutine for MaildirEnvelopeList {
                     .into_iter()
                     .filter_map(|entry| {
                         let bytes = contents.remove(entry.path())?;
-                        Some(envelope_from_message(&MaildirMessage::from((
-                            entry.path().clone(),
-                            bytes,
-                        ))))
+                        Some(envelope_from_message(
+                            &MaildirMessage::from((entry.path().clone(), bytes)),
+                            &self.dovecot_table,
+                            self.keywords_header,
+                        ))
                     })
                     .collect();
                 envelopes.sort_by(|a, b| b.date.cmp(&a.date));
@@ -142,10 +158,20 @@ enum State {
 }
 
 /// Builds an [`Envelope`] from a Maildir message: filename letters
-/// for flags, RFC 5322 headers via mail-parser.
-fn envelope_from_message(message: &MaildirMessage) -> Envelope {
+/// plus resolved custom keywords for flags, RFC 5322 headers via
+/// mail-parser.
+fn envelope_from_message(
+    message: &MaildirMessage,
+    dovecot_table: &BTreeMap<char, String>,
+    keywords_header: Option<KeywordHeader>,
+) -> Envelope {
     let id = message.id().unwrap_or_default().to_string();
-    let flags = parse_filename_flags(message.path());
+    let flags = flags_from_maildir(
+        message.path(),
+        message.contents(),
+        dovecot_table,
+        keywords_header,
+    );
     let size = message.contents().len() as u64;
     let parsed = message.parsed();
 
@@ -190,18 +216,6 @@ fn envelope_from_message(message: &MaildirMessage) -> Envelope {
         size,
         has_attachment,
     }
-}
-
-/// Extracts the IANA flag set from a Maildir filename's info section.
-/// Letters outside the standard six are silently dropped.
-fn parse_filename_flags(path: &MaildirPath) -> BTreeSet<Flag> {
-    let Some(name) = path.file_name() else {
-        return BTreeSet::new();
-    };
-    let Some((_, letters)) = name.rsplit_once(',') else {
-        return BTreeSet::new();
-    };
-    letters.chars().filter_map(flag_from_char).collect()
 }
 
 /// Converts mail-parser's address group into the shared LCD shape.

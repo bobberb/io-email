@@ -21,7 +21,7 @@
 //! [`MaildirMessagesList`]: io_maildir::coroutines::message_list::MaildirMessagesList
 
 use alloc::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     string::{String, ToString},
     vec::Vec,
 };
@@ -35,6 +35,7 @@ use io_maildir::{
         MaildirMessagesList as InnerList, MaildirMessagesListError as InnerErr,
     },
     entry::MaildirEntry,
+    flag::KeywordHeader,
     maildir::Maildir,
     message::MaildirMessage,
     path::MaildirPath,
@@ -46,8 +47,7 @@ use thiserror::Error;
 use crate::{
     address::Address,
     envelope::{Envelope, normalize_message_id},
-    flag::Flag,
-    maildir::convert::{InvalidMailboxName, flag_from_char, paginate, resolve_mailbox},
+    maildir::convert::{InvalidMailboxName, flags_from_maildir, paginate, resolve_mailbox},
     search::{
         filter::query::SearchEmailsFilterQuery,
         query::SearchEmailsQuery,
@@ -78,9 +78,15 @@ pub struct MaildirEnvelopeSearch {
     sort: Option<Vec<SearchEmailsSorter>>,
     page: Option<u32>,
     page_size: Option<u32>,
+    dovecot_table: BTreeMap<char, String>,
+    keywords_header: Option<KeywordHeader>,
 }
 
 impl MaildirEnvelopeSearch {
+    /// `dovecot_table` / `keywords_header` carry the same keyword
+    /// resolution knobs used by the listing path so `flag <keyword>`
+    /// filters match custom keywords persisted on write.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         root: impl Into<PathBuf>,
         maildir_plus: bool,
@@ -88,6 +94,8 @@ impl MaildirEnvelopeSearch {
         query: Option<&SearchEmailsQuery>,
         page: Option<u32>,
         page_size: Option<u32>,
+        dovecot_table: BTreeMap<char, String>,
+        keywords_header: Option<KeywordHeader>,
     ) -> Result<Self, MaildirEnvelopeSearchError> {
         trace!("prepare Maildir envelope search");
         let path = resolve_mailbox(&root.into(), maildir_plus, mailbox)?;
@@ -98,6 +106,8 @@ impl MaildirEnvelopeSearch {
             sort: query.and_then(|q| q.sort.clone()),
             page,
             page_size,
+            dovecot_table,
+            keywords_header,
         })
     }
 }
@@ -142,7 +152,12 @@ impl MaildirCoroutine for MaildirEnvelopeSearch {
                     let Some(bytes) = contents.remove(entry.path()) else {
                         continue;
                     };
-                    let envelope = envelope_from_bytes(entry.path(), &bytes);
+                    let envelope = envelope_from_bytes(
+                        entry.path(),
+                        &bytes,
+                        &self.dovecot_table,
+                        self.keywords_header,
+                    );
                     let keep = match self.filter.as_ref() {
                         Some(f) => matches_filter(&envelope, &bytes, f),
                         None => true,
@@ -174,12 +189,18 @@ enum State {
     Done,
 }
 
-/// Builds an [`Envelope`] from a Maildir file: filename letters for
-/// flags, RFC 5322 headers via mail-parser.
-fn envelope_from_bytes(path: &MaildirPath, bytes: &[u8]) -> Envelope {
+/// Builds an [`Envelope`] from a Maildir file: filename letters plus
+/// resolved custom keywords for flags, RFC 5322 headers via
+/// mail-parser.
+fn envelope_from_bytes(
+    path: &MaildirPath,
+    bytes: &[u8],
+    dovecot_table: &BTreeMap<char, String>,
+    keywords_header: Option<KeywordHeader>,
+) -> Envelope {
     let message = MaildirMessage::from((path.clone(), bytes.to_vec()));
     let id = message.id().unwrap_or_default().to_string();
-    let flags = parse_filename_flags(message.path());
+    let flags = flags_from_maildir(message.path(), bytes, dovecot_table, keywords_header);
     let size = message.contents().len() as u64;
     let parsed = message.parsed();
 
@@ -224,16 +245,6 @@ fn envelope_from_bytes(path: &MaildirPath, bytes: &[u8]) -> Envelope {
         size,
         has_attachment,
     }
-}
-
-fn parse_filename_flags(path: &MaildirPath) -> BTreeSet<Flag> {
-    let Some(name) = path.file_name() else {
-        return BTreeSet::new();
-    };
-    let Some((_, letters)) = name.rsplit_once(',') else {
-        return BTreeSet::new();
-    };
-    letters.chars().filter_map(flag_from_char).collect()
 }
 
 fn addresses_from(addrs: &MailParserAddress<'_>) -> Vec<Address> {
